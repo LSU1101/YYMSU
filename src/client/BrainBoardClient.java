@@ -7,12 +7,16 @@ import javax.swing.*;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
+import java.awt.event.MouseEvent;
+import java.awt.event.MouseListener;
 import java.io.*;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.UnknownHostException;
+import java.util.HashMap;
 import java.util.NoSuchElementException;
 import java.util.Scanner;
+import java.util.Vector;
 
 public class BrainBoardClient {
     private JFrame frame;
@@ -21,8 +25,11 @@ public class BrainBoardClient {
     private JLabel phaseLabel;
     private JLabel timeLabel;
 
-    // 가운데 칸 보드 (칸과 카드는 5단계에서 추가)
-    private JPanel boardPanel;
+    // 가운데 칸 보드
+    private JPanel boardPanel; // 칸들을 가로로 붙이는 패널
+    private Vector<GroupColumn> columns = new Vector<GroupColumn>(); // 0번은 항상 미분류
+    private HashMap<String, CardView> cardViews = new HashMap<String, CardView>(); // cardId → 카드
+    private CardView dragCard; // 지금 끌고 있는 카드
 
     // 오른쪽: 접속자, 최근 활동, 채팅
     private JTextArea userList;
@@ -113,13 +120,34 @@ public class BrainBoardClient {
         return topPanel;
     }
 
-    // 가운데: 칸 보드, 칸이 많아지면 가로로 스크롤
+    // 가운데: 칸 보드, 칸이 많아지면 스크롤
     private JScrollPane createBoardPanel() {
         boardPanel = new JPanel();
-        boardPanel.setLayout(new FlowLayout(FlowLayout.LEFT));
-        boardPanel.add(new JLabel("칸 보드 (5단계에서 칸과 카드 표시)"));
+        boardPanel.setLayout(new GridLayout(1, 0, 8, 0));
 
-        return new JScrollPane(boardPanel);
+        // 칸들을 왼쪽에 붙이고 높이는 꽉 채우기
+        JPanel wrapper = new JPanel();
+        wrapper.setLayout(new BorderLayout());
+        wrapper.add(boardPanel, BorderLayout.WEST);
+
+        resetBoard();
+
+        return new JScrollPane(wrapper);
+    }
+
+    // 보드를 비우고 미분류 칸만 남기기 (접속할 때마다 서버가 칸·카드를 다시 보내줌)
+    private void resetBoard() {
+        boardPanel.removeAll();
+        columns.clear();
+        cardViews.clear();
+        dragCard = null;
+
+        GroupColumn unsorted = new GroupColumn(null, "미분류");
+        columns.add(unsorted);
+        boardPanel.add(unsorted);
+
+        boardPanel.revalidate();
+        boardPanel.repaint();
     }
 
     // 오른쪽: 위에 접속자와 최근 활동, 아래에 채팅
@@ -132,6 +160,7 @@ public class BrainBoardClient {
         userList.setEditable(false);
         activity = new JTextArea();
         activity.setEditable(false);
+        activity.setLineWrap(true);
 
         sidePanel.add(createTitledPanel("접속자", new JScrollPane(userList)));
         sidePanel.add(createTitledPanel("최근 활동", new JScrollPane(activity)));
@@ -358,6 +387,7 @@ public class BrainBoardClient {
             host = false;
             frame.setTitle("BrainBoard");
             userList.setText("");
+            resetBoard();
             updateButtonState();
         }
     }
@@ -423,8 +453,15 @@ public class BrainBoardClient {
                 printActivity(((ActivityLog) msg).text);
             } else if (msg instanceof ErrorMessage) {
                 printDisplay("[알림] " + ((ErrorMessage) msg).text);
+            } else if (msg instanceof Group) {
+                showGroup((Group) msg);
+            } else if (msg instanceof IdeaCard) {
+                showCard((IdeaCard) msg);
+            } else if (msg instanceof CardMove) {
+                moveCard((CardMove) msg);
+            } else if (msg instanceof LockResult) {
+                handleLockResult((LockResult) msg);
             }
-            // IdeaCard, Group, CardMove, LockResult는 5단계에서 처리
         } catch (IOException e) {
             if (receiveThread != null) {
                 printDisplay("서버 연결이 끊어졌습니다.");
@@ -468,6 +505,158 @@ public class BrainBoardClient {
             userList.append(line + "\n");
         }
         updateTitle();
+    }
+
+    // [12] 새 칸을 맨 오른쪽에 추가
+    private void showGroup(Group group) {
+        if (findColumn(group.groupId) != null) {
+            return; // 이미 있는 칸
+        }
+
+        GroupColumn column = new GroupColumn(group.groupId, group.name);
+        columns.add(column);
+        boardPanel.add(column);
+        boardPanel.revalidate();
+        boardPanel.repaint();
+    }
+
+    // [11] 서버가 보낸 카드: 처음 보는 카드면 칸 맨 끝에 추가, 있던 카드면 모양만 갱신
+    private void showCard(IdeaCard card) {
+        CardView view = cardViews.get(card.cardId);
+
+        if (view == null) {
+            view = createCardView(card);
+            cardViews.put(card.cardId, view);
+
+            GroupColumn column = findColumn(card.groupId);
+            if (column == null) {
+                column = columns.get(0); // 모르는 칸이면 미분류에
+            }
+            column.addCard(view, -1);
+        } else {
+            view.update(card, myName);
+        }
+    }
+
+    // [15] 카드를 원래 칸에서 빼서 새 칸의 toIndex번째에 넣기
+    private void moveCard(CardMove move) {
+        CardView view = cardViews.get(move.cardId);
+        GroupColumn from = findColumn(move.fromGroupId);
+        GroupColumn to = findColumn(move.toGroupId);
+        if (view == null || from == null || to == null) {
+            return;
+        }
+
+        from.removeCard(view);
+        to.addCard(view, move.toIndex);
+        view.card.groupId = move.toGroupId;
+    }
+
+    // [14] 잠금 실패면 끌기 취소
+    private void handleLockResult(LockResult result) {
+        if (!result.granted) {
+            printDisplay("[알림] " + result.holderName + "님이 옮기는 중인 카드입니다.");
+            if (dragCard != null && dragCard.card.cardId.equals(result.cardId)) {
+                dragCard.setCursor(Cursor.getDefaultCursor());
+                dragCard = null;
+            }
+        }
+    }
+
+    // groupId로 칸 찾기 (null = 미분류)
+    private GroupColumn findColumn(String groupId) {
+        for (int i = 0; i < columns.size(); i++) {
+            GroupColumn c = columns.get(i);
+            if (groupId == null) {
+                if (c.groupId == null) {
+                    return c;
+                }
+            } else if (groupId.equals(c.groupId)) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    // 카드를 만들고 마우스로 끌 수 있게 연결
+    private CardView createCardView(IdeaCard card) {
+        final CardView view = new CardView(card, myName);
+
+        view.addMouseListener(new MouseListener() {
+            @Override
+            public void mousePressed(MouseEvent e) { // 누르면 잠금 요청
+                startDrag(view);
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) { // 놓으면 이동 요청
+                endDrag(view, e.getXOnScreen(), e.getYOnScreen());
+            }
+
+            @Override
+            public void mouseClicked(MouseEvent e) {
+
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent e) {
+
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+
+            }
+        });
+
+        return view;
+    }
+
+    // [13] 카드를 누르면 서버에 잠금 요청
+    private void startDrag(CardView view) {
+        if (!joined) {
+            return;
+        }
+        if (view.isLockedByOther(myName)) {
+            printDisplay("[알림] " + view.card.lockedBy + "님이 옮기는 중인 카드입니다.");
+            return;
+        }
+
+        dragCard = view;
+        view.setCursor(Cursor.getPredefinedCursor(Cursor.MOVE_CURSOR));
+        sendMessage(new LockRequest(view.card.cardId, "LOCK"));
+    }
+
+    // [15] 놓은 위치의 칸과 순서를 찾아 이동 요청, 제자리면 잠금 해제
+    private void endDrag(CardView view, int screenX, int screenY) {
+        if (dragCard != view) {
+            return; // 잠금 실패 등으로 끌기가 취소됨
+        }
+        dragCard = null;
+        view.setCursor(Cursor.getDefaultCursor());
+
+        GroupColumn from = findColumn(view.card.groupId);
+        GroupColumn to = null;
+        for (int i = 0; i < columns.size(); i++) {
+            if (columns.get(i).containsScreenX(screenX)) {
+                to = columns.get(i);
+                break;
+            }
+        }
+
+        if (to == null || from == null) {
+            sendMessage(new LockRequest(view.card.cardId, "UNLOCK")); // 칸 밖에 놓음
+            return;
+        }
+
+        int toIndex = to.dropIndex(screenY, view);
+        if (to == from && toIndex == from.indexOf(view)) {
+            sendMessage(new LockRequest(view.card.cardId, "UNLOCK")); // 제자리
+            return;
+        }
+
+        // 화면은 서버가 돌려준 CardMove를 받고 나서 바뀜
+        sendMessage(new CardMove(view.card.cardId, from.groupId, to.groupId, toIndex));
     }
 
     private void updateTitle() {
