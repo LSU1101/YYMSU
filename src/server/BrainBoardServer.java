@@ -234,6 +234,14 @@ public class BrainBoardServer {
 
                     if (msg instanceof ChatMessage) {
                         handleChat((ChatMessage) msg);
+                    } else if (msg instanceof IdeaCard) {
+                        handleCard((IdeaCard) msg);
+                    } else if (msg instanceof Group) {
+                        handleGroup((Group) msg);
+                    } else if (msg instanceof LockRequest) {
+                        handleLock((LockRequest) msg);
+                    } else if (msg instanceof CardMove) {
+                        handleMove((CardMove) msg);
                     } else {
                         sendMessage(new ErrorMessage("BAD_REQUEST", "아직 처리하지 않는 요청입니다."));
                     }
@@ -297,12 +305,89 @@ public class BrainBoardServer {
             broadcasting(msg);
         }
 
+        // [10][11] 카드 등록: 번호를 붙여 미분류 칸에 넣고 전체에 전달
+        private void handleCard(IdeaCard req) {
+            if (req.text == null || req.text.trim().length() == 0) {
+                sendMessage(new ErrorMessage("BAD_REQUEST", "카드 내용을 입력하세요."));
+                return;
+            }
+
+            IdeaCard card = board.addCard(req.text.trim(), userName);
+            broadcasting(card);
+            broadcasting(new ActivityLog(userName + "님이 '" + card.text + "' 카드를 추가함"));
+        }
+
+        // [12] 칸 만들기: 번호를 붙여 전체에 전달
+        private void handleGroup(Group req) {
+            if (req.name == null || req.name.trim().length() == 0) {
+                sendMessage(new ErrorMessage("BAD_REQUEST", "칸 이름을 입력하세요."));
+                return;
+            }
+
+            Group group = board.addGroup(req.name.trim(), userName);
+            broadcasting(group);
+            broadcasting(new ActivityLog(userName + "님이 '" + group.name + "' 칸을 만듦"));
+        }
+
+        // [13][14] 카드 잠금·잠금 해제
+        private void handleLock(LockRequest req) {
+            IdeaCard card = board.findCard(req.cardId);
+            if (card == null) {
+                sendMessage(new ErrorMessage("BAD_REQUEST", "없는 카드입니다."));
+                return;
+            }
+
+            if ("UNLOCK".equals(req.action)) {
+                if (board.unlock(card, userName)) {
+                    broadcasting(card); // 잠금 풀린 카드
+                }
+                return;
+            }
+
+            // 잠금: 먼저 잡은 한 명만 성공
+            boolean granted = board.lock(card, userName);
+            LockResult result = new LockResult(card.cardId, granted, card.lockedBy);
+            result.requestId = req.requestId;
+            sendMessage(result);
+
+            if (granted) {
+                broadcasting(card); // 잠긴 카드 (lockedBy가 채워짐)
+                broadcasting(new ActivityLog(userName + "님이 '" + card.text + "' 카드를 잡음"));
+            }
+        }
+
+        // [15] 카드 이동: 잠근 사람만 옮길 수 있음
+        private void handleMove(CardMove req) {
+            IdeaCard card = board.findCard(req.cardId);
+            if (card == null || !board.groupExists(req.toGroupId)) {
+                sendMessage(new ErrorMessage("BAD_REQUEST", "없는 카드나 칸입니다."));
+                return;
+            }
+
+            boolean moved = board.move(card, req, userName);
+            if (!moved) {
+                sendMessage(new ErrorMessage("LOCK_DENIED", "먼저 카드를 잡아야 옮길 수 있습니다."));
+                return;
+            }
+
+            // req의 fromGroupId, toIndex는 move()에서 실제 값으로 바뀜
+            broadcasting(req);
+            broadcasting(card); // 잠금 풀린 카드
+            broadcasting(new ActivityLog(userName + "님이 '" + card.text + "' 카드를 '" + board.groupName(card.groupId) + "' 칸으로 옮김"));
+        }
+
         // [6][7] 퇴장 처리
         private void removeUser() {
             users.removeElement(this);
 
             if (userName == null) {
                 return; // 입장 전에 나간 경우는 안내 없음
+            }
+
+            // [16] 나간 사람이 잡고 있던 카드는 잠금 해제
+            Vector<IdeaCard> unlocked = board.unlockAll(userName);
+            for (int i = 0; i < unlocked.size(); i++) {
+                broadcasting(unlocked.get(i));
             }
 
             // 방장이 나가면 남은 사람 중 첫 번째가 방장
@@ -374,10 +459,163 @@ public class BrainBoardServer {
     }
 
     // 보드 상태 보관 (ScoreManager처럼 내부 클래스)
-    // 카드 등록·이동·잠금 처리는 4단계에서 추가
+    // 여러 ClientHandler 스레드가 동시에 부르므로 바꾸는 메서드는 synchronized
+    // → 두 사람이 같은 카드를 동시에 잡아도 한 명만 성공
     private class BoardManager {
         private Vector<Group> groups = new Vector<Group>();
-        private Vector<IdeaCard> cards = new Vector<IdeaCard>();
+        private Vector<IdeaCard> cards = new Vector<IdeaCard>(); // 이 순서가 칸 안의 카드 순서
+        private int cardCount = 0; // cardId 발급용 번호
+        private int groupCount = 0; // groupId 발급용 번호
+
+        // 새 카드를 미분류 칸 맨 끝에 추가
+        public synchronized IdeaCard addCard(String text, String author) {
+            cardCount++;
+
+            IdeaCard card = new IdeaCard(text);
+            card.cardId = "C" + cardCount;
+            card.authorName = author;
+            card.groupId = null;
+            card.order = countCards(null);
+            cards.add(card);
+
+            return card;
+        }
+
+        // 새 칸을 맨 오른쪽에 추가
+        public synchronized Group addGroup(String name, String creator) {
+            groupCount++;
+
+            Group group = new Group(name);
+            group.groupId = "G" + groupCount;
+            group.order = groups.size();
+            group.createdBy = creator;
+            groups.add(group);
+
+            return group;
+        }
+
+        public IdeaCard findCard(String cardId) {
+            for (int i = 0; i < cards.size(); i++) {
+                if (cards.get(i).cardId.equals(cardId)) {
+                    return cards.get(i);
+                }
+            }
+            return null;
+        }
+
+        // null은 미분류 칸이므로 항상 있음
+        public boolean groupExists(String groupId) {
+            return groupId == null || groupName(groupId) != null;
+        }
+
+        public String groupName(String groupId) {
+            if (groupId == null) {
+                return "미분류";
+            }
+            for (int i = 0; i < groups.size(); i++) {
+                if (groups.get(i).groupId.equals(groupId)) {
+                    return groups.get(i).name;
+                }
+            }
+            return null;
+        }
+
+        // 비어 있거나 내가 이미 잡은 카드면 성공
+        public synchronized boolean lock(IdeaCard card, String name) {
+            if (card.lockedBy == null || card.lockedBy.equals(name)) {
+                card.lockedBy = name;
+                return true;
+            }
+            return false;
+        }
+
+        // 내가 잡은 카드만 풀 수 있음
+        public synchronized boolean unlock(IdeaCard card, String name) {
+            if (name.equals(card.lockedBy)) {
+                card.lockedBy = null;
+                return true;
+            }
+            return false;
+        }
+
+        // 이 사람이 잡고 있던 카드를 모두 풀고, 풀린 카드 목록 돌려주기
+        public synchronized Vector<IdeaCard> unlockAll(String name) {
+            Vector<IdeaCard> unlocked = new Vector<IdeaCard>();
+
+            for (int i = 0; i < cards.size(); i++) {
+                IdeaCard card = cards.get(i);
+                if (name.equals(card.lockedBy)) {
+                    card.lockedBy = null;
+                    unlocked.add(card);
+                }
+            }
+            return unlocked;
+        }
+
+        // 카드를 다른 칸의 toIndex번째로 옮기고 잠금 해제, 잠근 사람이 아니면 false
+        public synchronized boolean move(IdeaCard card, CardMove move, String name) {
+            if (!name.equals(card.lockedBy)) {
+                return false;
+            }
+
+            move.fromGroupId = card.groupId; // 실제로 있던 칸
+            cards.removeElement(card);
+
+            // 옮길 칸에서 toIndex번째 카드 앞에 끼워 넣기 (없으면 맨 끝)
+            int position = cards.size();
+            int index = 0;
+            for (int i = 0; i < cards.size(); i++) {
+                if (sameGroup(cards.get(i).groupId, move.toGroupId)) {
+                    if (index == move.toIndex) {
+                        position = i;
+                        break;
+                    }
+                    index++;
+                }
+            }
+            if (position == cards.size()) {
+                move.toIndex = countCards(move.toGroupId); // 범위를 넘으면 맨 끝
+            }
+
+            cards.add(position, card);
+            card.groupId = move.toGroupId;
+            card.lockedBy = null;
+            renumber();
+
+            return true;
+        }
+
+        // 이 칸에 있는 카드 수
+        private int countCards(String groupId) {
+            int count = 0;
+            for (int i = 0; i < cards.size(); i++) {
+                if (sameGroup(cards.get(i).groupId, groupId)) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
+        // 칸마다 order를 0, 1, 2 ... 로 다시 매기기
+        private void renumber() {
+            for (int i = 0; i < cards.size(); i++) {
+                IdeaCard card = cards.get(i);
+                card.order = 0;
+                for (int j = 0; j < i; j++) {
+                    if (sameGroup(cards.get(j).groupId, card.groupId)) {
+                        card.order++;
+                    }
+                }
+            }
+        }
+
+        // groupId 비교 (null = 미분류끼리도 같은 칸)
+        private boolean sameGroup(String a, String b) {
+            if (a == null) {
+                return b == null;
+            }
+            return a.equals(b);
+        }
     }
 
     public static void main(String[] args) {
